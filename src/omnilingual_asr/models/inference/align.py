@@ -19,9 +19,10 @@ from torch import Tensor
 try:
     from omnilingual_asr.models.inference.pipeline import ASRInferencePipeline
     from omnilingual_asr.models.wav2vec2_llama.model import Wav2Vec2LlamaModel
-    from omnilingual_asr.models.wav2vec2_llama.syntax import lang_id_getter
-except ImportError:
-    pass  # Type checking only
+except ImportError as e:
+    print(f"ImportError: {e}")
+
+from omnilingual_asr.models.wav2vec2_llama.syntax import lang_id_getter
 
 
 # =============================================================================
