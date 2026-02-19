@@ -640,7 +640,7 @@ class ASRInferencePipeline:
             if chunk_len is not None and duration > chunk_len:
                 chunks = chunk_waveform(waveform, 16000, chunk_len)
             else:
-                if duration > MAX_ALLOWED_AUDIO_SEC and chunk_len is None:
+                if duration > MAX_ALLOWED_AUDIO_SEC and chunk_len is None and not self.streaming_config.is_streaming:
                     raise ValueError(
                         f"Audio {idx} duration {duration:.2f}s > {MAX_ALLOWED_AUDIO_SEC}s. Provide chunk_len parameter."
                     )
