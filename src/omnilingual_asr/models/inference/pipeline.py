@@ -97,7 +97,6 @@ def resample_to_16khz(
     current_sample_rate = audio_data["sample_rate"]
 
     if current_sample_rate != target_sample_rate:
-        # Resample the waveform using torchaudio functional
         log.debug(f"Resampling from {current_sample_rate}Hz to {target_sample_rate}Hz")
 
         # Different audio reading mechanisms can cause the shape to be either (channels, time)
@@ -202,25 +201,18 @@ class ASRInferencePipeline:
 
         # Load or use provided model and tokenizer
         if model_card is not None:
-            # Load from model card (original behavior)
             log.info(f"Loading model from model card: {model_card}")
             self.model = load_model(model_card, device=self.device, dtype=self.dtype)
 
-            # Load tokenizer from model card
             log.info(f"Loading tokenizer from model card: {model_card}")
             self.tokenizer = load_tokenizer(model_card)
         else:
-            # Use provided model and tokenizer
             assert isinstance(tokenizer, Tokenizer)
             assert isinstance(model, (Wav2Vec2LlamaModel, Wav2Vec2AsrModel))
             log.info("Using provided model and tokenizer")
             self.model = model
-            self.model = self.model.to(
-                device=self.device
-            )  # TODO avoid moving buffers to dtype
+            self.model = self.model.to(device=self.device)
             self.tokenizer = tokenizer
-
-        # Set model to evaluation mode
 
         self.model.eval()
 
@@ -250,12 +242,10 @@ class ASRInferencePipeline:
                 streaming_config=self.streaming_config,
             )
 
-        # Set up tokenizer decoder
-        assert self.tokenizer is not None  # Should always be non-None at this point
+        assert self.tokenizer is not None
         self.token_decoder = self.tokenizer.create_decoder(skip_special_tokens=True)
         self.token_encoder = self.tokenizer.create_encoder()
 
-        # Set up audio processor
         self.audio_decoder = AudioDecoder(dtype=torch.float32)
         self.file_mapper = FileMapper(cached_fd_count=200)
         pad_idx = getattr(self.tokenizer.vocab_info, "pad_idx", 0)
@@ -263,7 +253,7 @@ class ASRInferencePipeline:
 
         self.full_collater = Collater(
             pad_value=0,
-            overrides=[text_collate_opts],  # Default pad value for audio
+            overrides=[text_collate_opts],
         )
         self.collater_audio = Collater(pad_value=0)
         self.collater_text = Collater(pad_value=pad_idx)
@@ -279,7 +269,6 @@ class ASRInferencePipeline:
         self, wavs_langs: List[Tuple[torch.Tensor, str | None]]
     ) -> Seq2SeqBatch:
         """Create a Seq2SeqBatch from audio tensors using fairseq2 utilities."""
-        # Create audio data structure similar to ASR task
         audio_examples = []
         for item in wavs_langs:
             audio_examples.append(
@@ -291,13 +280,8 @@ class ASRInferencePipeline:
                 }
             )
 
-        # Use Collater with proper pad_value for audio (0) and text (pad_idx)
-        # Following ASR task's approach with CollateOptionsOverride for text
-
-        # Collate the examples
         collated_data = self.full_collater(audio_examples)
 
-        # Extract audio and text data
         audio_data = collated_data["audio_feature"]
         text_data = collated_data["text"]
 
@@ -305,7 +289,6 @@ class ASRInferencePipeline:
         if all(x is None for x in example["lang"]):
             example = {}
 
-        # Following ASR task's to_seq2seq_batch method
         return Seq2SeqBatch(
             source_seqs=audio_data["seqs"].to(self.device, self.dtype),
             source_seq_lens=audio_data["seq_lens"],
@@ -326,13 +309,9 @@ class ASRInferencePipeline:
         transcriptions = []
 
         for i in range(pred_ids.shape[0]):
-            # Create a mask for where consecutive elements differ (CTC decoding)
-            # First element is always True, then compare with previous elements
             seq = pred_ids[i][: bl_out.seq_lens[i]]
             mask = torch.ones(seq.shape[0], dtype=torch.bool, device=seq.device)
             mask[1:] = seq[1:] != seq[:-1]
-
-            # Use the mask to select non-duplicate tokens
             decoded_ids = seq[mask]
             transcriptions.append(self.token_decoder(decoded_ids))
         return transcriptions
@@ -371,7 +350,6 @@ class ASRInferencePipeline:
                 )[0]
                 audio_embeddings.append(embedded)
 
-            # Generate hypotheses using beam search
             hypothesis_tokens, hypothesis_lens = (
                 self.beam_search_generator.generate_hypotheses(
                     decoder_context_inputs=None,
@@ -385,7 +363,6 @@ class ASRInferencePipeline:
                 batch, return_decoder_inputs=True
             )
 
-            # Generate hypotheses using beam search
             hypothesis_tokens, hypothesis_lens = (
                 self.beam_search_generator.generate_hypotheses(
                     decoder_context_inputs=decoder_context,
@@ -395,7 +372,6 @@ class ASRInferencePipeline:
                 )
             )
 
-        # Decode tokens to text
         transcriptions = []
         for i in range(hypothesis_tokens.shape[0]):
             seq_len = hypothesis_lens[i] if hypothesis_lens is not None else 0
@@ -422,7 +398,6 @@ class ASRInferencePipeline:
         self, inp_list: AudioInput, check_max_length: bool = True
     ) -> DataPipelineBuilder:
         """Process audio inputs using fairseq2.data pipeline similar to ASR task."""
-        # Build pipeline based on input type
         builder = read_sequence(inp_list)
 
         need_to_decode = True
@@ -430,16 +405,14 @@ class ASRInferencePipeline:
         if isinstance(first_element, (Path, str)):
             builder = builder.map(str)
             builder = builder.map(self.file_mapper)
-        elif isinstance(
-            first_element, (bytes, np.ndarray)
-        ):  # list of audio bytes in memory
+        elif isinstance(first_element, (bytes, np.ndarray)):
             if isinstance(first_element, np.ndarray):
                 assert first_element.dtype in [
                     np.uint8,
                     np.int8,
                 ], "Only uint8 numpy arrays are supported"
             builder = builder.map(lambda x: {"data": MemoryBlock(x)})
-        elif isinstance(first_element, dict):  # list[dict([waveform, sample_rate])]
+        elif isinstance(first_element, dict):
             need_to_decode = False
             log.info("Processing pre-decoded audio dictionaries")
             builder = builder.map(
@@ -456,21 +429,18 @@ class ASRInferencePipeline:
         if need_to_decode:
             builder = builder.map(self.audio_decoder, selector="data")
 
-        # Resample
         builder = builder.map(resample_to_16khz, selector="data")
 
-        # Check max allowed length if non-streaming
         non_streaming = not self.streaming_config.is_streaming
         if non_streaming and check_max_length:
             builder = builder.map(assert_max_length, selector="data")
 
-        # Add waveform processing
         builder = add_waveform_processing(
             builder,
             normalize_audio=True,
             dtype=self.dtype,
-            selector="data.waveform",  # Process the waveform from decoded audio
-            spec_aug_p=None,  # No SpecAugment for inference
+            selector="data.waveform",
+            spec_aug_p=None,
             spec_aug_freq_mask_param=0,
             spec_aug_time_mask_param=0,
         )
@@ -493,8 +463,6 @@ class ASRInferencePipeline:
         if not context_examples:
             return None
 
-        # Use the same audio processing pipeline as main inference
-        # Cast mixed list to AudioInput to satisfy type checker
         raw_audio = cast(AudioInput, [example.audio for example in context_examples])
         builder = self._build_audio_wavform_pipeline(raw_audio)
         context_audio_tensors = list(builder.and_return())
@@ -524,8 +492,6 @@ class ASRInferencePipeline:
 
         context_text_tensors = []
         for example in context_examples:
-            # Tokenize the text using the tokenizer's encoder
-
             text_tensor = self.token_encoder(example.text)
             context_text_tensors.append(text_tensor)
         collated_text = self.collater_text(context_text_tensors)
@@ -540,18 +506,9 @@ class ASRInferencePipeline:
     ) -> Seq2SeqBatch:
         """
         Create a Seq2SeqBatch with zero-shot context support.
-
-        Args:
-            wavs: List of audio tensors for transcription
-            per_audio_context_examples: List of context examples for each audio input
-
-        Returns:
-            Seq2SeqBatch with context information
         """
-        # Start with the basic batch creation (with empty lang)
         batch = self._create_batch_simple([(item[0], None) for item in combined_batch])  # type: ignore[index]
 
-        # Process context examples for each input audio
         context_audio = []
         context_text = []
         for combined_item in combined_batch:
@@ -565,6 +522,99 @@ class ASRInferencePipeline:
         batch.example["context_text"] = context_text  # type: ignore[index]
         return batch
 
+    def _embed_audio_segment(self, wav_segment: torch.Tensor, input_lang: str | None) -> ModalityInput:
+        """
+        Embed a raw waveform segment into a ModalityInput using the model's audio encoder.
+        Used by the unlimited streaming sliding window path.
+        """
+        assert isinstance(self.model, Wav2Vec2LlamaModel)
+        batch_data = [(wav_segment, input_lang)]
+        seq2seq_batch = self._create_batch_simple(batch_data)
+        audio_mod = ModalityInput(
+            modality=Modality.AUDIO,
+            seqs=seq2seq_batch.source_seqs,
+            seq_lens=seq2seq_batch.source_seq_lens,
+            loss=False,
+            embedded=False,
+        )
+        return self.model.embed_inputs([audio_mod], dtype=self.dtype)[0]
+
+    def _transcribe_unlimited_streaming_chunk(
+        self,
+        wav_segment: torch.Tensor,
+        input_lang: str | None,
+        historical_audio_embeddings: List[ModalityInput],
+        historical_text_tokens: List[ModalityInput],
+    ) -> str:
+        """
+        Run transcription for one chunk on an unlimited streaming model,
+        passing historical audio embeddings and text tokens as context.
+        """
+        assert isinstance(self.model, Wav2Vec2LlamaModel)
+        assert self.beam_search_generator is not None
+
+        current_audio_emb = self._embed_audio_segment(wav_segment, input_lang)
+        n_total = torch.tensor(
+            [len(historical_audio_embeddings) + 1],
+            device=self.device,
+            dtype=torch.int32,
+        )
+        langs = [input_lang] if input_lang else None
+
+        tokens, lens = self.beam_search_generator.generate_hypotheses_one_segment_streaming(
+            new_audio_embeddings=current_audio_emb.seqs,
+            new_audio_embedding_seq_lens=current_audio_emb.seq_lens,
+            n_total_segments=n_total,
+            langs=langs,  # type: ignore
+            previous_audio_embeddings=historical_audio_embeddings,
+            previous_text_tokens=historical_text_tokens,
+        )
+        return self.token_decoder(tokens[0, : lens[0]])
+
+    def _update_unlimited_history(
+        self,
+        wav_segment: torch.Tensor,
+        safe_text: str,
+        safe_duration_sec: float,
+        input_lang: str | None,
+        historical_audio_embeddings: List[ModalityInput],
+        historical_text_tokens: List[ModalityInput],
+        max_history: int,
+    ) -> None:
+        """
+        Append the safe portion of the current chunk to history (in-place),
+        then trim to `max_history` segments.
+
+        Only the audio up to `safe_duration_sec` and the corresponding safe text
+        are added — dropped words are excluded from history so the model doesn't
+        see them as ground truth context in future chunks.
+        """
+        assert isinstance(self.model, Wav2Vec2LlamaModel)
+
+        safe_samples = int(safe_duration_sec * 16000)
+        safe_wav = wav_segment[:safe_samples]
+
+        safe_audio_emb = self._embed_audio_segment(safe_wav, input_lang)
+
+        safe_text_tokens_t = (
+            self.token_encoder(safe_text).unsqueeze(0).to(self.device, torch.int64)
+        )
+        safe_text_modality = ModalityInput(
+            modality=Modality.TEXT,
+            seqs=safe_text_tokens_t,
+            seq_lens=[safe_text_tokens_t.size(1)],
+            loss=False,
+            embedded=False,
+        )
+
+        historical_audio_embeddings.append(safe_audio_emb)
+        historical_text_tokens.append(safe_text_modality)
+
+        # Trim to window
+        if len(historical_audio_embeddings) > max_history:
+            historical_audio_embeddings.pop(0)
+            historical_text_tokens.pop(0)
+
     @torch.inference_mode()
     def transcribe(
         self,
@@ -573,17 +623,22 @@ class ASRInferencePipeline:
         lang: List[str | None] | List[str] | List[None] | None = None,
         batch_size: int = 2,
         chunk_len: float | None = None,
-        sliding_window: bool = False,
         overlap_drop_sec: float = 1.0,
     ) -> Tuple[List[str], List[List[Dict[str, Any]]]]:
         """
-        Transcribes `AudioInput` into text by preprocessing (decoding, resample to 16kHz, converting to mono, normalizing)
-        each input sample and performing inference with `self.model`.
+        Transcribes `AudioInput` into text by preprocessing (decoding, resample to 16kHz,
+        converting to mono, normalizing) each input sample and performing inference with
+        `self.model`.
 
         Returns text and extracted timestamps.
 
-        Works for both CTC and LLM model variants by optionally allowing a language conditioning token to help with LLM generation.
-        It is ignored when performing inference with CTC. See `omnilingual_asr/models/wav2vec2_llama/lang_ids.py` for supported languages.
+        For unlimited streaming LLM models (streaming_config.is_streaming=True), chunking
+        uses a dynamic sliding window: the next window start is determined by the last word
+        that ends safely before `chunk_end - overlap_drop_sec`. History (audio embeddings +
+        text tokens) from previous safe chunks is fed as context to each new chunk, capped
+        at `streaming_config.n_context_segments`.
+
+        For non-streaming models, non-overlapping chunks via `chunk_waveform` are used.
 
         Args:
             `inp`: Audio input in different forms.
@@ -592,11 +647,14 @@ class ASRInferencePipeline:
                 - `List[ np.ndarray ]`: Audio data as uint8 numpy array
                 - `List[ dict[str, Any] ]`: Pre-decoded audio with 'waveform' and 'sample_rate' keys
             `lang`: Language code for the input audios (e.g., 'eng_Latn', ...) (default: None)
-                - List [ str | None ]`: Any combination of missing and available language ids.
-            `batch_size`: Number of audio samples to process in each batch (per chunk).
-            `chunk_len`: Maximum length in seconds for processing. Longer files will be split.
-            `sliding_window`: Whether to use a dynamic sliding window approach for long audio instead of non-overlapping chunks.
-            `overlap_drop_sec`: If using sliding_window, how many seconds at the end of the chunk to drop to prevent half-cut words.
+            `batch_size`: Number of audio samples to process in each batch (used for non-streaming path).
+            `chunk_len`: Maximum window length in seconds. Required for audio longer than
+                MAX_ALLOWED_AUDIO_SEC. For streaming models this is the upper-bound window;
+                actual advancement is determined dynamically by timestamps.
+            `overlap_drop_sec`: For the streaming sliding window, words whose end timestamp
+                falls within this many seconds of the chunk boundary are considered unsafe
+                and dropped (not committed to output or history). The next window starts from
+                the last safe word's end time. Defaults to 1.0s.
 
         Returns:
             Tuple[List[str], List[List[Dict[str, Any]]]]:
@@ -610,29 +668,35 @@ class ASRInferencePipeline:
         is_ctc_model = isinstance(self.model, Wav2Vec2AsrModel)
         is_llm_model = isinstance(self.model, Wav2Vec2LlamaModel)
         is_llm_zs_model = is_llm_model and self.model.model_type == ModelType.ZERO_SHOT
+        is_unlimited_streaming = (
+            is_llm_model
+            and self.streaming_config is not None
+            and self.streaming_config.is_streaming
+        )
 
         if is_ctc_model and lang:
             log.info(f"Found {lang=} with a CTC model. Ignoring.")
         if is_llm_model and not lang:
-            log.info("Using an LLM model without a `lang` code can lead to degraded trascription quality.")
+            log.info("Using an LLM model without a `lang` code can lead to degraded transcription quality.")
         if is_llm_zs_model:
-            raise NotImplementedError("Model does not support inference without context conditioning."
-                                      "Please use `.transcribe_with_context()` instead of `.transcribe()`.")
+            raise NotImplementedError(
+                "Model does not support inference without context conditioning. "
+                "Please use `.transcribe_with_context()` instead of `.transcribe()`."
+            )
 
-        # invariant: lang must be the same length as the input
         if not lang:
             lang = [None] * len(inp)
 
-        assert len(lang) == len(inp), f"`lang` must be a list of the same length as `inp` ({len(inp)}), but is {len(lang)}."
+        assert len(lang) == len(inp), (
+            f"`lang` must be a list of the same length as `inp` ({len(inp)}), "
+            f"but is {len(lang)}."
+        )
         # fmt: on
 
         final_transcripts = []
         final_timestamps = []
 
-        # Pre-load waveforms one by one to handle chunking without pipeline's strict length check
-        # This replaces the streaming data pipeline with an eager loading strategy to support chunking/alignment
         for idx, (input_item, input_lang) in enumerate(zip(inp, lang)):
-            # Use pipeline builder to decode/resample/norm, but bypass length check
             single_input: AudioInput = cast(AudioInput, [input_item])
             p = self._build_audio_wavform_pipeline(
                 single_input, check_max_length=False
@@ -641,132 +705,128 @@ class ASRInferencePipeline:
 
             duration = waveform.shape[0] / 16000.0
 
-            if chunk_len is not None and duration > chunk_len:
-                if sliding_window:
-                    # Sequential sliding window approach
-                    chunk_start = 0.0
-                    input_text_parts = []
-                    input_timestamps = []
-                    
-                    # Track history cleanly for unlimited streaming models
-                    is_unlimited = isinstance(self.model, Wav2Vec2LlamaModel) and hasattr(self, "streaming_config") and self.streaming_config.is_streaming
-                    historical_audio_embeddings = []
-                    historical_text_tokens = []
-                    
-                    while chunk_start < duration:
-                        chunk_end = min(duration, chunk_start + chunk_len)
-                        chunk_samples = int((chunk_end - chunk_start) * 16000)
-                        start_sample = int(chunk_start * 16000)
-                        
-                        wav_segment = waveform[start_sample : start_sample + chunk_samples]
-                        
-                        # Process single chunk
-                        batch_data = [(wav_segment, input_lang)]
-                        seq2seq_batch = self._create_batch_simple(batch_data)
-                        
-                        if is_unlimited:
-                            audio_mod = ModalityInput(Modality.AUDIO, seq2seq_batch.source_seqs, seq2seq_batch.source_seq_lens, False)
-                            current_audio_emb = self.model.embed_inputs([audio_mod], self.dtype)[0]
-                            n_total = torch.tensor([len(historical_audio_embeddings) + 1], device=self.device, dtype=torch.int32)
-                            langs = [input_lang] if input_lang else None
-                            
-                            tokens, lens = self.beam_search_generator.generate_hypotheses_one_segment_streaming(
-                                new_audio_embeddings=current_audio_emb.seqs,
-                                new_audio_embedding_seq_lens=current_audio_emb.seq_lens,
-                                n_total_segments=n_total,
-                                langs=langs, # type: ignore
-                                previous_audio_embeddings=historical_audio_embeddings,
-                                previous_text_tokens=historical_text_tokens,
+            # ----------------------------------------------------------------
+            # Unlimited streaming model → dynamic sliding window
+            # ----------------------------------------------------------------
+            if is_unlimited_streaming and chunk_len is not None and duration > chunk_len:
+                max_history = getattr(
+                    self.streaming_config, "n_context_segments", 1
+                )
+
+                historical_audio_embeddings: List[ModalityInput] = []
+                historical_text_tokens: List[ModalityInput] = []
+
+                chunk_start = 0.0
+                input_text_parts: List[str] = []
+                input_timestamps: List[Dict[str, Any]] = []
+
+                while chunk_start < duration:
+                    chunk_end = min(duration, chunk_start + chunk_len)
+                    start_sample = int(chunk_start * 16000)
+                    chunk_samples = int((chunk_end - chunk_start) * 16000)
+                    wav_segment = waveform[start_sample : start_sample + chunk_samples]
+
+                    # Transcribe with history as context
+                    text = self._transcribe_unlimited_streaming_chunk(
+                        wav_segment,
+                        input_lang,
+                        historical_audio_embeddings,
+                        historical_text_tokens,
+                    )
+
+                    if not text.strip():
+                        # Nothing transcribed — advance by a fixed stride and continue
+                        chunk_start += chunk_len - overlap_drop_sec
+                        continue
+
+                    # Align current chunk's audio vs its own transcription only
+                    chunk_ts: List[Dict[str, Any]] = []
+                    try:
+                        chunk_ts = align_llm(self, wav_segment, text, input_lang)
+                    except Exception as e:
+                        log.warning(
+                            f"Alignment failed for streaming chunk at {chunk_start:.2f}s "
+                            f"of input {idx}: {e}"
+                        )
+
+                    is_last_chunk = chunk_end >= duration
+
+                    if not is_last_chunk and chunk_ts:
+                        # Determine safe boundary: words must end before this threshold
+                        safe_threshold = (chunk_end - chunk_start) - overlap_drop_sec
+                        safe_ts = [w for w in chunk_ts if w["end"] <= safe_threshold]
+
+                        if safe_ts:
+                            # Commit safe words; next window starts at last safe word's end
+                            committed_ts = safe_ts
+                            next_start = chunk_start + safe_ts[-1]["end"]
+                            safe_duration_sec = safe_ts[-1]["end"]
+                        else:
+                            # Fallback: no safe words found — commit all, advance by fixed stride
+                            log.debug(
+                                f"No safe words found at chunk_start={chunk_start:.2f}s; "
+                                f"falling back to fixed stride."
                             )
-                            text = self.token_decoder(tokens[0, :lens[0]])
-                        else:
-                            texts = self._apply_model(seq2seq_batch)
-                            text = texts[0]
-                        
-                        if not text.strip():
-                            chunk_start += chunk_len - overlap_drop_sec
-                            continue
-                            
-                        chunk_ts = []
-                        try:
-                            if isinstance(self.model, Wav2Vec2AsrModel):
-                                chunk_ts = align_ctc(self.model, wav_segment, 16000, text)
-                            elif isinstance(self.model, Wav2Vec2LlamaModel):
-                                chunk_ts = align_llm(self, wav_segment, text, input_lang)
-                        except Exception as e:
-                            log.warning(f"Alignment failed for sliding window chunk at {chunk_start}s: {e}")
-                            chunk_ts = []
-                        
-                        if chunk_end < duration and chunk_ts:
-                            # We are not at the end of the file. Filter out words that end too close to the chunk boundary
-                            safe_end_time = (chunk_end - chunk_start) - overlap_drop_sec
-                            valid_ts = [w for w in chunk_ts if w['end'] <= safe_end_time]
-                            
-                            if not valid_ts:
-                                # No safe words found, fallback to standard striding
-                                append_ts = chunk_ts
-                                next_start = chunk_start + chunk_len - overlap_drop_sec
-                            else:
-                                append_ts = valid_ts
-                                next_start = chunk_start + valid_ts[-1]['end']
-                        else:
-                            # Last chunk, keep everything
-                            append_ts = chunk_ts
-                            next_start = duration
-                            
-                        # Adjust timestamps and reconstruct text
-                        chunk_text_parts = []
-                        for w in append_ts:
-                            word_text = w.get('word', w.get('char', ''))
-                            chunk_text_parts.append(word_text)
-                                
-                            input_timestamps.append({
-                                'word': word_text,
-                                'start': w['start'] + chunk_start,
-                                'end': w['end'] + chunk_start,
-                            })
-                            
-                        safe_text_str = ""
-                        if chunk_text_parts:
-                            if 'word' in append_ts[0]:
-                                safe_text_str = " ".join(chunk_text_parts)
-                            else:
-                                safe_text_str = "".join(chunk_text_parts)
-                            input_text_parts.append(safe_text_str)
-                            
-                        if is_unlimited and safe_text_str:
-                            safe_samples = int((next_start - chunk_start) * 16000)
-                            safe_wav_segment = wav_segment[:safe_samples]
-                            
-                            safe_batch_data = [(safe_wav_segment, input_lang)]
-                            safe_seq2seq_batch = self._create_batch_simple(safe_batch_data)
-                            safe_audio_mod = ModalityInput(Modality.AUDIO, safe_seq2seq_batch.source_seqs, safe_seq2seq_batch.source_seq_lens, False)
-                            safe_audio_emb = self.model.embed_inputs([safe_audio_mod], self.dtype)[0]
-                            
-                            safe_text_tokens_t = self.token_encoder(safe_text_str).unsqueeze(0).to(self.device).to(torch.int64)
-                            safe_text_modality = ModalityInput(Modality.TEXT, safe_text_tokens_t, [safe_text_tokens_t.size(1)], False)
-                            
-                            historical_audio_embeddings.append(safe_audio_emb)
-                            historical_text_tokens.append(safe_text_modality)
-                            
-                            if len(historical_audio_embeddings) > self.streaming_config.n_context_segments:
-                                historical_audio_embeddings.pop(0)
-                                historical_text_tokens.pop(0)
-                        
-                        # Slide window
-                        chunk_start = next_start
-                        
-                    full_transcript = " ".join(t for t in input_text_parts if t.strip())
-                    final_transcripts.append(full_transcript)
-                    final_timestamps.append(input_timestamps)
-                    continue
-                else:
-                    # Non-sliding chunking
-                    chunks = chunk_waveform(waveform, 16000, chunk_len)
+                            committed_ts = chunk_ts
+                            next_start = chunk_start + chunk_len - overlap_drop_sec
+                            safe_duration_sec = chunk_len - overlap_drop_sec
+                    else:
+                        # Last chunk — commit everything
+                        committed_ts = chunk_ts
+                        next_start = duration
+                        safe_duration_sec = chunk_end - chunk_start
+
+                    # Build committed text from committed timestamps
+                    is_word_level = committed_ts and "word" in committed_ts[0]
+                    word_parts = [
+                        w.get("word", w.get("char", "")) for w in committed_ts
+                    ]
+                    if is_word_level:
+                        committed_text = " ".join(word_parts)
+                    else:
+                        committed_text = "".join(word_parts)
+
+                    # Adjust timestamps to global timeline and record
+                    for w in committed_ts:
+                        input_timestamps.append({
+                            "word": w.get("word", w.get("char", "")),
+                            "start": w["start"] + chunk_start,
+                            "end": w["end"] + chunk_start,
+                        })
+
+                    if committed_text.strip():
+                        input_text_parts.append(committed_text)
+
+                        # Update history with only the safe portion of audio + text.
+                        # Dropped words are intentionally excluded so future chunks don't
+                        # see them as committed context.
+                        self._update_unlimited_history(
+                            wav_segment=wav_segment,
+                            safe_text=committed_text,
+                            safe_duration_sec=safe_duration_sec,
+                            input_lang=input_lang,
+                            historical_audio_embeddings=historical_audio_embeddings,
+                            historical_text_tokens=historical_text_tokens,
+                            max_history=max_history,
+                        )
+
+                    chunk_start = next_start
+
+                full_transcript = " ".join(t for t in input_text_parts if t.strip())
+                final_transcripts.append(full_transcript)
+                final_timestamps.append(input_timestamps)
+                continue  # Move to next input item
+
+            # ----------------------------------------------------------------
+            # Non-streaming (or unlimited streaming without chunking needed)
+            # ----------------------------------------------------------------
+            if chunk_len is not None and duration > chunk_len:
+                chunks = chunk_waveform(waveform, 16000, chunk_len)
             else:
                 if duration > MAX_ALLOWED_AUDIO_SEC and chunk_len is None:
                     raise ValueError(
-                        f"Audio {idx} duration {duration:.2f}s > {MAX_ALLOWED_AUDIO_SEC}s. Provide chunk_len parameter."
+                        f"Audio {idx} duration {duration:.2f}s > {MAX_ALLOWED_AUDIO_SEC}s. "
+                        f"Provide chunk_len parameter."
                     )
                 chunks = [(waveform, 0.0)]
 
@@ -776,7 +836,6 @@ class ASRInferencePipeline:
             chunk_waveforms = [c[0] for c in chunks]
             offsets = [c[1] for c in chunks]
 
-            # Process chunks in batches
             for i in range(0, len(chunk_waveforms), batch_size):
                 batch_wavs = chunk_waveforms[i : i + batch_size]
                 batch_offsets = offsets[i : i + batch_size]
@@ -806,9 +865,11 @@ class ASRInferencePipeline:
                         chunk_ts = []
 
                     for w in chunk_ts:
-                        # Rename key to 'word' if it was 'char' for consistency in output 
-                        out_dict = {'word': w.get('word', w.get('char', '')), 'start': w['start'] + offset, 'end': w['end'] + offset}
-                        input_timestamps.append(out_dict)
+                        input_timestamps.append({
+                            "word": w.get("word", w.get("char", "")),
+                            "start": w["start"] + offset,
+                            "end": w["end"] + offset,
+                        })
 
                     input_text_parts.append(text)
 
