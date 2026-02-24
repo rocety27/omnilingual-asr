@@ -648,6 +648,11 @@ class ASRInferencePipeline:
                     input_text_parts = []
                     input_timestamps = []
                     
+                    # Track history cleanly for unlimited streaming models
+                    is_unlimited = isinstance(self.model, Wav2Vec2LlamaModel) and hasattr(self, "streaming_config") and self.streaming_config.is_streaming
+                    historical_audio_embeddings = []
+                    historical_text_tokens = []
+                    
                     while chunk_start < duration:
                         chunk_end = min(duration, chunk_start + chunk_len)
                         chunk_samples = int((chunk_end - chunk_start) * 16000)
@@ -658,8 +663,25 @@ class ASRInferencePipeline:
                         # Process single chunk
                         batch_data = [(wav_segment, input_lang)]
                         seq2seq_batch = self._create_batch_simple(batch_data)
-                        texts = self._apply_model(seq2seq_batch)
-                        text = texts[0]
+                        
+                        if is_unlimited:
+                            audio_mod = ModalityInput(Modality.AUDIO, seq2seq_batch.source_seqs, seq2seq_batch.source_seq_lens, False)
+                            current_audio_emb = self.model.embed_inputs([audio_mod], self.dtype)[0]
+                            n_total = torch.tensor([len(historical_audio_embeddings) + 1], device=self.device, dtype=torch.int32)
+                            langs = [input_lang] if input_lang else None
+                            
+                            tokens, lens = self.beam_search_generator.generate_hypotheses_one_segment_streaming(
+                                new_audio_embeddings=current_audio_emb.seqs,
+                                new_audio_embedding_seq_lens=current_audio_emb.seq_lens,
+                                n_total_segments=n_total,
+                                langs=langs, # type: ignore
+                                previous_audio_embeddings=historical_audio_embeddings,
+                                previous_text_tokens=historical_text_tokens,
+                            )
+                            text = self.token_decoder(tokens[0, :lens[0]])
+                        else:
+                            texts = self._apply_model(seq2seq_batch)
+                            text = texts[0]
                         
                         if not text.strip():
                             chunk_start += chunk_len - overlap_drop_sec
@@ -695,12 +717,8 @@ class ASRInferencePipeline:
                         # Adjust timestamps and reconstruct text
                         chunk_text_parts = []
                         for w in append_ts:
-                            # Reconstruct text carefully depending on whether it's word or char mode
                             word_text = w.get('word', w.get('char', ''))
-                            if 'word' in w:
-                                chunk_text_parts.append(word_text)
-                            else:
-                                chunk_text_parts.append(word_text)
+                            chunk_text_parts.append(word_text)
                                 
                             input_timestamps.append({
                                 'word': word_text,
@@ -708,11 +726,32 @@ class ASRInferencePipeline:
                                 'end': w['end'] + chunk_start,
                             })
                             
+                        safe_text_str = ""
                         if chunk_text_parts:
                             if 'word' in append_ts[0]:
-                                input_text_parts.append(" ".join(chunk_text_parts))
+                                safe_text_str = " ".join(chunk_text_parts)
                             else:
-                                input_text_parts.append("".join(chunk_text_parts))
+                                safe_text_str = "".join(chunk_text_parts)
+                            input_text_parts.append(safe_text_str)
+                            
+                        if is_unlimited and safe_text_str:
+                            safe_samples = int((next_start - chunk_start) * 16000)
+                            safe_wav_segment = wav_segment[:safe_samples]
+                            
+                            safe_batch_data = [(safe_wav_segment, input_lang)]
+                            safe_seq2seq_batch = self._create_batch_simple(safe_batch_data)
+                            safe_audio_mod = ModalityInput(Modality.AUDIO, safe_seq2seq_batch.source_seqs, safe_seq2seq_batch.source_seq_lens, False)
+                            safe_audio_emb = self.model.embed_inputs([safe_audio_mod], self.dtype)[0]
+                            
+                            safe_text_tokens_t = self.token_encoder(safe_text_str).unsqueeze(0).to(self.device).to(torch.int64)
+                            safe_text_modality = ModalityInput(Modality.TEXT, safe_text_tokens_t, [safe_text_tokens_t.size(1)], False)
+                            
+                            historical_audio_embeddings.append(safe_audio_emb)
+                            historical_text_tokens.append(safe_text_modality)
+                            
+                            if len(historical_audio_embeddings) > self.streaming_config.n_context_segments:
+                                historical_audio_embeddings.pop(0)
+                                historical_text_tokens.pop(0)
                         
                         # Slide window
                         chunk_start = next_start
