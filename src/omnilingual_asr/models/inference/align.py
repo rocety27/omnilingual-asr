@@ -349,9 +349,6 @@ def align_llm(
         bos_emb = model.embed_text(
             torch.tensor([[vocab_info.bos_idx]], device=pipeline.device), pipeline.dtype
         )
-        sep_emb = model.embed_text(
-            torch.tensor([[vocab_info.size]], device=pipeline.device), pipeline.dtype
-        )
 
         lang_emb = torch.zeros(
             1, 0, audio_features.shape[-1], device=pipeline.device, dtype=pipeline.dtype
@@ -363,9 +360,28 @@ def align_llm(
                 torch.tensor([lid], device=pipeline.device).unsqueeze(0)
             )
 
-        full_input = torch.cat(
-            [audio_features, sep_emb, lang_emb, bos_emb, text_embeddings], dim=1
-        )
+        is_streaming = getattr(model, "streaming_config", None) is not None and getattr(model.streaming_config, "is_streaming", False)
+
+        audio_start_idx = 0
+        if is_streaming:
+            lid_marker_emb = model.embed_text(
+                torch.tensor([[model.special_tokens.lid_marker]], device=pipeline.device), pipeline.dtype
+            )
+            last_segment_emb = model.embed_text(
+                torch.tensor([[model.special_tokens.last_segment]], device=pipeline.device), pipeline.dtype
+            )
+            full_input = torch.cat(
+                [lang_emb, lid_marker_emb, audio_features, last_segment_emb, bos_emb, text_embeddings], dim=1
+            )
+            audio_start_idx = lang_emb.shape[1] + lid_marker_emb.shape[1]
+        else:
+            sep_emb = model.embed_text(
+                torch.tensor([[vocab_info.size]], device=pipeline.device), pipeline.dtype
+            )
+            full_input = torch.cat(
+                [audio_features, sep_emb, lang_emb, bos_emb, text_embeddings], dim=1
+            )
+            audio_start_idx = 0
 
     except Exception as e:
         print(f"Error preparing LLM alignment inputs: {e}")
@@ -411,10 +427,9 @@ def align_llm(
 
     # 3. DTW
     L_audio = audio_features.shape[1]
-    L_pre = sep_emb.shape[1] + lang_emb.shape[1] + bos_emb.shape[1]
     L_text = text_embeddings.shape[1]
 
-    query_start = L_audio + L_pre
+    query_start = full_input.shape[1] - L_text
 
     sorted_layers = sorted(_attention_store.weights.keys())
     num_layers = len(sorted_layers)
@@ -429,7 +444,7 @@ def align_llm(
         avg_attn += _attention_store.weights[l]
     avg_attn /= len(selected)
 
-    cross_attn = avg_attn[query_start : query_start + L_text, :L_audio].numpy()
+    cross_attn = avg_attn[query_start : query_start + L_text, audio_start_idx : audio_start_idx + L_audio].numpy()
 
     aligned_frames = forced_alignment_dtw(cross_attn)
 
