@@ -573,6 +573,8 @@ class ASRInferencePipeline:
         lang: List[str | None] | List[str] | List[None] | None = None,
         batch_size: int = 2,
         chunk_len: float | None = None,
+        sliding_window: bool = False,
+        overlap_drop_sec: float = 1.0,
     ) -> Tuple[List[str], List[List[Dict[str, Any]]]]:
         """
         Transcribes `AudioInput` into text by preprocessing (decoding, resample to 16kHz, converting to mono, normalizing)
@@ -593,6 +595,8 @@ class ASRInferencePipeline:
                 - List [ str | None ]`: Any combination of missing and available language ids.
             `batch_size`: Number of audio samples to process in each batch (per chunk).
             `chunk_len`: Maximum length in seconds for processing. Longer files will be split.
+            `sliding_window`: Whether to use a dynamic sliding window approach for long audio instead of non-overlapping chunks.
+            `overlap_drop_sec`: If using sliding_window, how many seconds at the end of the chunk to drop to prevent half-cut words.
 
         Returns:
             Tuple[List[str], List[List[Dict[str, Any]]]]:
@@ -638,7 +642,88 @@ class ASRInferencePipeline:
             duration = waveform.shape[0] / 16000.0
 
             if chunk_len is not None and duration > chunk_len:
-                chunks = chunk_waveform(waveform, 16000, chunk_len)
+                if sliding_window:
+                    # Sequential sliding window approach
+                    chunk_start = 0.0
+                    input_text_parts = []
+                    input_timestamps = []
+                    
+                    while chunk_start < duration:
+                        chunk_end = min(duration, chunk_start + chunk_len)
+                        chunk_samples = int((chunk_end - chunk_start) * 16000)
+                        start_sample = int(chunk_start * 16000)
+                        
+                        wav_segment = waveform[start_sample : start_sample + chunk_samples]
+                        
+                        # Process single chunk
+                        batch_data = [(wav_segment, input_lang)]
+                        seq2seq_batch = self._create_batch_simple(batch_data)
+                        texts = self._apply_model(seq2seq_batch)
+                        text = texts[0]
+                        
+                        if not text.strip():
+                            chunk_start += chunk_len - overlap_drop_sec
+                            continue
+                            
+                        chunk_ts = []
+                        try:
+                            if isinstance(self.model, Wav2Vec2AsrModel):
+                                chunk_ts = align_ctc(self.model, wav_segment, 16000, text)
+                            elif isinstance(self.model, Wav2Vec2LlamaModel):
+                                chunk_ts = align_llm(self, wav_segment, text, input_lang)
+                        except Exception as e:
+                            log.warning(f"Alignment failed for sliding window chunk at {chunk_start}s: {e}")
+                            chunk_ts = []
+                        
+                        if chunk_end < duration and chunk_ts:
+                            # We are not at the end of the file. Filter out words that end too close to the chunk boundary
+                            safe_end_time = (chunk_end - chunk_start) - overlap_drop_sec
+                            valid_ts = [w for w in chunk_ts if w['end'] <= safe_end_time]
+                            
+                            if not valid_ts:
+                                # No safe words found, fallback to standard striding
+                                append_ts = chunk_ts
+                                next_start = chunk_start + chunk_len - overlap_drop_sec
+                            else:
+                                append_ts = valid_ts
+                                next_start = chunk_start + valid_ts[-1]['end']
+                        else:
+                            # Last chunk, keep everything
+                            append_ts = chunk_ts
+                            next_start = duration
+                            
+                        # Adjust timestamps and reconstruct text
+                        chunk_text_parts = []
+                        for w in append_ts:
+                            # Reconstruct text carefully depending on whether it's word or char mode
+                            word_text = w.get('word', w.get('char', ''))
+                            if 'word' in w:
+                                chunk_text_parts.append(word_text)
+                            else:
+                                chunk_text_parts.append(word_text)
+                                
+                            input_timestamps.append({
+                                'word': word_text,
+                                'start': w['start'] + chunk_start,
+                                'end': w['end'] + chunk_start,
+                            })
+                            
+                        if chunk_text_parts:
+                            if 'word' in append_ts[0]:
+                                input_text_parts.append(" ".join(chunk_text_parts))
+                            else:
+                                input_text_parts.append("".join(chunk_text_parts))
+                        
+                        # Slide window
+                        chunk_start = next_start
+                        
+                    full_transcript = " ".join(t for t in input_text_parts if t.strip())
+                    final_transcripts.append(full_transcript)
+                    final_timestamps.append(input_timestamps)
+                    continue
+                else:
+                    # Non-sliding chunking
+                    chunks = chunk_waveform(waveform, 16000, chunk_len)
             else:
                 if duration > MAX_ALLOWED_AUDIO_SEC and chunk_len is None:
                     raise ValueError(
@@ -682,9 +767,9 @@ class ASRInferencePipeline:
                         chunk_ts = []
 
                     for w in chunk_ts:
-                        w["start"] += offset
-                        w["end"] += offset
-                        input_timestamps.append(w)
+                        # Rename key to 'word' if it was 'char' for consistency in output 
+                        out_dict = {'word': w.get('word', w.get('char', '')), 'start': w['start'] + offset, 'end': w['end'] + offset}
+                        input_timestamps.append(out_dict)
 
                     input_text_parts.append(text)
 

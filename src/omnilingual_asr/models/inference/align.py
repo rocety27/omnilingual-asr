@@ -22,7 +22,7 @@ try:
 except ImportError as e:
     print(f"ImportError: {e}")
 
-from omnilingual_asr.models.wav2vec2_llama.syntax import lang_id_getter
+    from omnilingual_asr.models.wav2vec2_llama.syntax import lang_id_getter
 
 
 # =============================================================================
