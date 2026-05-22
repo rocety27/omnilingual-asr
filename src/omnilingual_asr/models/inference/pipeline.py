@@ -570,6 +570,26 @@ class ASRInferencePipeline:
         safe_samples = int(safe_duration_sec * 16000)
         safe_wav = wav_segment[:safe_samples]
 
+        # The wav2vec2 feature extractor has a stack of Conv1d layers that
+        # progressively downsample the raw waveform.  If the slice is shorter
+        # than ~400 samples (~25 ms at 16 kHz) the signal is reduced to fewer
+        # samples than the kernel size of a downstream conv layer, causing a
+        # RuntimeError.  Skip the history update in that case — the
+        # transcription itself already succeeded; we just lose one context
+        # segment, which is harmless.
+        _MIN_EMBED_SAMPLES = 400
+        if safe_wav.shape[0] < _MIN_EMBED_SAMPLES:
+            log.warning(
+                f"safe_wav too short for embedding "
+                f"({safe_wav.shape[0]} samples, need >= {_MIN_EMBED_SAMPLES}); "
+                f"skipping history update"
+            )
+            print(
+                f"  [history] SKIPPED — safe_wav only {safe_wav.shape[0]} samples "
+                f"(min {_MIN_EMBED_SAMPLES})"
+            )
+            return
+
         safe_audio_emb = self._embed_audio_segment(safe_wav, input_lang)
 
         safe_text_tokens_t = (
