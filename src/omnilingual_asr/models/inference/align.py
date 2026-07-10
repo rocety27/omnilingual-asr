@@ -61,6 +61,46 @@ def chunk_waveform(
     return chunks
 
 
+def chunk_waveform_overlap(
+    waveform: Tensor,
+    sample_rate: int,
+    chunk_len_sec: float,
+    overlap_drop_sec: float,
+) -> List[Tuple[Tensor, float, bool]]:
+    """Split waveform into overlapping chunks with fixed stride.
+
+    Each chunk has length ``chunk_len_sec``.  The stride between consecutive
+    chunks is ``chunk_len_sec - overlap_drop_sec``, so every chunk overlaps the
+    next one by ``overlap_drop_sec`` seconds.  Words that fall in the overlap
+    zone (the last ``overlap_drop_sec`` seconds of a non-final chunk) are
+    expected to be dropped by the caller (safe-commit), because they will be
+    re-transcribed in the following chunk with more context.
+
+    Returns a list of ``(wav_segment, chunk_start_sec, is_last_chunk)``.
+    """
+    if waveform.ndim != 1:
+        raise ValueError("waveform must be 1D")
+    if overlap_drop_sec < 0:
+        raise ValueError("overlap_drop_sec must be non-negative")
+    if overlap_drop_sec >= chunk_len_sec:
+        raise ValueError("overlap_drop_sec must be smaller than chunk_len_sec")
+
+    chunk_samples = int(chunk_len_sec * sample_rate)
+    stride_samples = int((chunk_len_sec - overlap_drop_sec) * sample_rate)
+    T = waveform.shape[0]
+    chunks: List[Tuple[Tensor, float, bool]] = []
+    start = 0
+    while start < T:
+        end = min(T, start + chunk_samples)
+        chunk_start_sec = start / float(sample_rate)
+        is_last = end >= T
+        chunks.append((waveform[start:end], chunk_start_sec, is_last))
+        if is_last:
+            break
+        start += stride_samples
+    return chunks
+
+
 def split_text_units(transcript: str, mode: str) -> List[Tuple[str, int, int]]:
     """
     Split transcript into alignment units.
