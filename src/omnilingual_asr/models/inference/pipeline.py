@@ -37,6 +37,7 @@ from omnilingual_asr.models.inference.align import (
     align_ctc,
     align_llm,
     chunk_waveform,
+    chunk_waveform_overlap,
 )
 from omnilingual_asr.models.wav2vec2_llama.beamsearch import (
     Wav2Vec2LlamaBeamSearchSeq2SeqGenerator,
@@ -624,13 +625,21 @@ class ASRInferencePipeline:
         batch_size: int = 2,
         chunk_len: float | None = None,
         overlap_drop_sec: float = 1.0,
+        max_history: int | None = None,
     ) -> Tuple[List[str], List[List[Dict[str, Any]]]]:
         """
         Transcribes AudioInput into text.
 
         For unlimited streaming LLM models (streaming_config.is_streaming=True), uses a
-        dynamic sliding window with history context. For non-streaming models, uses
-        non-overlapping chunks via chunk_waveform.
+        dynamic sliding window with history context. For non-streaming LLM models,
+        uses fixed-stride overlapping chunks with safe-commit (same boundary
+        semantics as streaming, but batched and without history context).
+
+        Args:
+            max_history: Override the number of history segments passed as context
+                to the streaming decoder. When 0, the streaming path runs with
+                dynamic stride but NO history context. When None (default), uses
+                streaming_config.n_context_segments. Ignored for non-streaming models.
         """
 
         if len(inp) == 0:
@@ -682,7 +691,11 @@ class ASRInferencePipeline:
             # Unlimited streaming model → dynamic sliding window
             # ----------------------------------------------------------------
             if is_unlimited_streaming and chunk_len is not None and duration > chunk_len:
-                max_history = getattr(self.streaming_config, "n_context_segments", 1)
+                effective_max_history = (
+                    max_history if max_history is not None
+                    else getattr(self.streaming_config, "n_context_segments", 1)
+                )
+                use_history = effective_max_history > 0
 
                 historical_audio_embeddings: List[ModalityInput] = []
                 historical_text_tokens: List[ModalityInput] = []
@@ -767,15 +780,16 @@ class ASRInferencePipeline:
 
                     if committed_text.strip():
                         input_text_parts.append(committed_text)
-                        self._update_unlimited_history(
-                            wav_segment=wav_segment,
-                            safe_text=committed_text,
-                            safe_duration_sec=safe_duration_sec,
-                            input_lang=input_lang,
-                            historical_audio_embeddings=historical_audio_embeddings,
-                            historical_text_tokens=historical_text_tokens,
-                            max_history=max_history,
-                        )
+                        if use_history:
+                            self._update_unlimited_history(
+                                wav_segment=wav_segment,
+                                safe_text=committed_text,
+                                safe_duration_sec=safe_duration_sec,
+                                input_lang=input_lang,
+                                historical_audio_embeddings=historical_audio_embeddings,
+                                historical_text_tokens=historical_text_tokens,
+                                max_history=effective_max_history,
+                            )
 
                     chunk_start = next_start
                     chunk_idx += 1
@@ -786,28 +800,52 @@ class ASRInferencePipeline:
                 continue
 
             # ----------------------------------------------------------------
-            # Non-streaming path
+            # Non-streaming path (LLM and CTC)
             # ----------------------------------------------------------------
+            #
+            # For LLM models with overlap_drop_sec > 0, use fixed-stride
+            # overlapping chunks with safe-commit (same boundary semantics as
+            # the streaming path, but batched and without history context).
+            # For CTC models or overlap_drop_sec == 0, fall back to the
+            # original non-overlapping chunk_waveform().
 
-            if chunk_len is not None and duration > chunk_len:
-                chunks = chunk_waveform(waveform, 16000, chunk_len)
+            is_non_streaming_llm = is_llm_model and not is_unlimited_streaming
+            use_overlap = (
+                is_non_streaming_llm
+                and chunk_len is not None
+                and duration > chunk_len
+                and overlap_drop_sec > 0
+            )
+
+            if use_overlap:
+                chunks = chunk_waveform_overlap(
+                    waveform, 16000, chunk_len, overlap_drop_sec
+                )
+            elif chunk_len is not None and duration > chunk_len:
+                raw_chunks = chunk_waveform(waveform, 16000, chunk_len)
+                chunks = [
+                    (wav, offset, i == len(raw_chunks) - 1)
+                    for i, (wav, offset) in enumerate(raw_chunks)
+                ]
             else:
                 if duration > MAX_ALLOWED_AUDIO_SEC and chunk_len is None:
                     raise ValueError(
                         f"Audio {idx} duration {duration:.2f}s > {MAX_ALLOWED_AUDIO_SEC}s. "
                         f"Provide chunk_len parameter."
                     )
-                chunks = [(waveform, 0.0)]
+                chunks = [(waveform, 0.0, True)]
 
-            input_text_parts = []
-            input_timestamps = []
+            input_text_parts: List[str] = []
+            input_timestamps: List[Dict[str, Any]] = []
 
             chunk_waveforms = [c[0] for c in chunks]
-            offsets = [c[1] for c in chunks]
+            chunk_starts = [c[1] for c in chunks]
+            chunk_is_last = [c[2] for c in chunks]
 
             for i in range(0, len(chunk_waveforms), batch_size):
                 batch_wavs = chunk_waveforms[i : i + batch_size]
-                batch_offsets = offsets[i : i + batch_size]
+                batch_starts = chunk_starts[i : i + batch_size]
+                batch_is_last = chunk_is_last[i : i + batch_size]
 
                 batch_data = [(w, input_lang) for w in batch_wavs]
                 seq2seq_batch = self._create_batch_simple(batch_data)
@@ -815,13 +853,15 @@ class ASRInferencePipeline:
 
                 for j, text in enumerate(texts):
                     wav_segment = batch_wavs[j]
-                    offset = batch_offsets[j]
+                    chunk_start = batch_starts[j]
+                    is_last_chunk = batch_is_last[j]
+                    chunk_duration = wav_segment.shape[0] / 16000.0
 
                     if not text.strip():
                         input_text_parts.append("")
                         continue
 
-                    chunk_ts = []
+                    chunk_ts: List[Dict[str, Any]] = []
                     try:
                         if isinstance(self.model, Wav2Vec2AsrModel):
                             chunk_ts = align_ctc(self.model, wav_segment, 16000, text)
@@ -836,14 +876,42 @@ class ASRInferencePipeline:
                         print(f"[transcribe] input[{idx}] chunk[{i+j}] alignment FAILED: {e}")
                         chunk_ts = []
 
-                    for w in chunk_ts:
+                    # Safe-commit: drop words in the overlap zone for non-final chunks
+                    if use_overlap and not is_last_chunk and chunk_ts:
+                        safe_threshold = chunk_duration - overlap_drop_sec
+                        committed_ts = [
+                            w for w in chunk_ts if w["end"] <= safe_threshold
+                        ]
+                        if not committed_ts:
+                            # No safe words — keep all, rely on next chunk to overlap
+                            committed_ts = chunk_ts
+                            log.debug(
+                                f"No safe words at chunk_start={chunk_start:.2f}s; "
+                                f"committing all."
+                            )
+                    else:
+                        committed_ts = chunk_ts
+
+                    # Adjust timestamps to global timeline and reconstruct text
+                    is_word_level = committed_ts and "word" in committed_ts[0]
+                    word_parts = [
+                        w.get("word", w.get("char", "")) for w in committed_ts
+                    ]
+                    committed_text = (
+                        " ".join(word_parts) if is_word_level else "".join(word_parts)
+                    )
+
+                    for w in committed_ts:
                         input_timestamps.append({
                             "word": w.get("word", w.get("char", "")),
-                            "start": w["start"] + offset,
-                            "end": w["end"] + offset,
+                            "start": w["start"] + chunk_start,
+                            "end": w["end"] + chunk_start,
                         })
 
-                    input_text_parts.append(text)
+                    if committed_text.strip():
+                        input_text_parts.append(committed_text)
+                    else:
+                        input_text_parts.append(text)
 
             full_transcript = " ".join(t for t in input_text_parts if t.strip())
             final_transcripts.append(full_transcript)
